@@ -1,0 +1,8 @@
+# R package dependencies for empirical/NMIFigures.R
+# Install with: install.packages(c(...))
+
+caret        # >= 6.0-94   unified model training framework
+randomForest # >= 4.7      Random Forest (German Credit classifier)
+gbm          # >= 2.1.8    Gradient Boosting Machine (Ames Housing regressor)
+ciu          # >= 1.0.0    Contextual Importance and Utility
+AmesHousing  # >= 0.0.4    Ames Housing dataset (De Cock 2011)
