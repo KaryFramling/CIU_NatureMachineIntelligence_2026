@@ -304,7 +304,7 @@ PI_LEGEND = [
     mpatches.Patch(facecolor=C_PI_BG, edgecolor="#999999",
                    label="CI — potential range"),
     mpatches.Patch(facecolor=C_GREEN, alpha=0.88,
-                   label="CI x CU — current utility (green=good, red=bad)"),
+                   label="CI x CU — current utility \n(green=good, red=bad)"),
 ]
 
 
@@ -364,7 +364,7 @@ for i, fname in enumerate(FEATURE_NAMES):
     ax.text(r["CI"] + 0.01, i,
             f"CI={r['CI']:.2f}, CU={r['CU']:.2f}",
             va="center", fontsize=7.5, color="#333")
-ax.legend(handles=PI_LEGEND, fontsize=7.5, loc="upper right", frameon=False)
+ax.legend(handles=PI_LEGEND, fontsize=7.5, loc="upper right", bbox_to_anchor=(1.0, 0.85), frameon=False)
 fig.tight_layout()
 savefig("pi_plot_wealth", fig)
 plt.close(fig)
@@ -423,7 +423,7 @@ for i, fname in enumerate(FEATURE_NAMES):
     ax1.text(r["CI"] + 0.005, i,
              f"CI={r['CI']:.2f}, CU={r['CU']:.2f}",
              va="center", fontsize=7.5, color="#333")
-ax1.legend(handles=PI_LEGEND, fontsize=7, loc="upper right", frameon=False)
+ax1.legend(handles=PI_LEGEND, fontsize=7, loc="upper right", bbox_to_anchor=(1.0, 0.85), frameon=False)
 
 # SHAP (right)
 ax2.set_title("SHAP — feature attributions", fontsize=9)

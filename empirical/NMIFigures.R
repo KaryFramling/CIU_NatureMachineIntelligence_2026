@@ -22,9 +22,6 @@ library(AmesHousing) # Ames Housing
 library(igraph)
 
 # ── Output directories ────────────────────────────────────────────────────────
-dir.create("figures", recursive = TRUE, showWarnings = FALSE)
-dir.create("cache",   recursive = TRUE, showWarnings = FALSE)
-
 # ── Nature figure dimensions (inches) ────────────────────────────────────────
 FIG_W_1COL <- 3.50
 FIG_W_2COL <- 7.20
@@ -32,6 +29,7 @@ FIG_H      <- 4.20
 
 # Save helper – cairo_pdf for production-quality vector output
 save.fig <- function(p, name, width = FIG_W_2COL, height = FIG_H) {
+  dir.create("figures", recursive = TRUE, showWarnings = FALSE)
   path <- file.path("figures", paste0(name, ".pdf"))
   cairo_pdf(path, width = width, height = height)
   print(p)
@@ -41,11 +39,75 @@ save.fig <- function(p, name, width = FIG_W_2COL, height = FIG_H) {
 
 # Cache helpers
 cache.save <- function(obj, name) {
+  dir.create("cache", recursive = TRUE, showWarnings = FALSE)
   saveRDS(obj, file.path("cache", paste0(name, ".rds")))
 }
 cache.load <- function(name) {
   path <- file.path("cache", paste0(name, ".rds"))
+  if (!dir.exists("cache")) return(NULL)
   if (file.exists(path)) readRDS(path) else NULL
+}
+
+# ── CIU perturbation samples per feature / intermediate concept ─────────────
+# 1000 handles intermediate concepts (several features varied jointly) well.
+N_SAMPLES <- 1000
+FIG_SEED  <- 42     # seed for the perturbation sampling in each figure
+
+# ── PI-plot colours ───────────────────────────────────────────────────────────
+# "overlap" mode: light-grey CI bar (potential range) with the CI×CU bar on top,
+# coloured by CU on the red–yellow–green scale. cu.colours = NULL is what
+# switches the CU bar from a fixed colour to the CU gradient.
+PI.CI.COLOURS <- c("grey85", "grey50", "1")
+PI.CU.COLOURS <- NULL
+
+# ── Random Forest smoothing / calibration ────────────────────────────────────
+# Raw RF class probabilities are vote fractions: step-like along each feature
+# and, when evaluated on training data, pushed towards 0/1. Two remedies:
+#   1. more trees + larger terminal nodes -> smoother response surface;
+#   2. Platt scaling (logistic sigmoid fitted on the out-of-bag votes) ->
+#      well-calibrated, "softened" probabilities.
+RF_NTREE    <- 1000
+RF_NODESIZE <- 10
+
+#' Platt scaling fitted on out-of-bag RF votes.
+#' Returns a function p -> calibrated p.
+platt.calibrate <- function(rf.train, y, positive = "good") {
+  fm    <- rf.train$finalModel
+  eps   <- 1 / (2 * fm$ntree)
+  clamp <- function(p) pmin(pmax(p, eps), 1 - eps)
+  z     <- qlogis(clamp(fm$votes[, positive]))      # OOB vote fractions
+  ok    <- is.finite(z)
+  fit   <- glm(as.integer(y[ok] == positive) ~ z[ok], family = binomial)
+  a <- unname(coef(fit)[1]); b <- unname(coef(fit)[2])
+  message(sprintf("Platt scaling: a = %.3f, b = %.3f", a, b))
+  function(p) plogis(a + b * qlogis(clamp(p)))
+}
+
+#' Pick the instance that best illustrates "importance is not influence".
+#' Candidates: the n.cand instances whose predicted output is closest to the
+#' average prediction. Among them, choose the one with the most concepts that
+#' are important (CI > ci.min) yet have near-zero influence (|phi| < phi.zero);
+#' ties broken by the total divergence sum(CI - 2|phi|).
+select.typical.instance <- function(ciu.obj, data, target, preds,
+                                    concepts, out.ind = 1,
+                                    n.cand = 40, n.samples = N_SAMPLES,
+                                    ci.min = 0.10, phi.zero = 0.02,
+                                    neutral.CU = 0.5) {
+  cand <- order(abs(preds - mean(preds)))[seq_len(min(n.cand, length(preds)))]
+  scores <- t(vapply(cand, function(ii) {
+    inst <- data[ii, colnames(data) != target, drop = FALSE]
+    meta <- ciu.obj$meta.explain(inst, concepts.to.explain = concepts,
+                                 n.samples = n.samples)
+    fr  <- ciu.list.to.frame(meta$ciuvals, out.ind = out.ind)
+    phi <- fr$CI * (fr$CU - neutral.CU)
+    c(n.zero     = sum(fr$CI > ci.min & abs(phi) < phi.zero),
+      divergence = sum(fr$CI - 2 * abs(phi)))
+  }, numeric(2)))
+  best <- order(-scores[, "n.zero"], -scores[, "divergence"])[1]
+  message(sprintf("Typical instance: row %d, %d/%d concepts with CI>%.2f and |phi|<%.2f, divergence %.3f",
+                  cand[best], scores[best, "n.zero"], length(concepts),
+                  ci.min, phi.zero, scores[best, "divergence"]))
+  cand[best]
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -86,43 +148,85 @@ german.setup <- function(use.cache = TRUE) {
   # Train Random Forest via caret
   set.seed(42)
   kfoldcv <- trainControl(method = "cv", number = 10)
-  rf.model <- train(credit_risk ~ ., german, method = "rf", trControl = kfoldcv)
+  rf.model <- train(credit_risk ~ ., german, method = "rf", trControl = kfoldcv,
+                    ntree = RF_NTREE, nodesize = RF_NODESIZE)
+
+  # Softened (Platt-calibrated) probabilities used for ALL CIU computations
+  calib    <- platt.calibrate(rf.model, german$credit_risk, positive = "good")
+  pred.fun <- function(model, inputs) {
+    q <- calib(predict(model, inputs, type = "prob")[, "good"])
+    data.frame(bad = 1 - q, good = q)
+  }
 
   # CIU objects
-  ciu.obj <- ciu.new(rf.model, credit_risk ~ ., german, vocabulary = voc)
-  ciu.plain <- ciu.new(rf.model, credit_risk ~ ., german)
+  ciu.obj   <- ciu.new(rf.model, credit_risk ~ ., german, vocabulary = voc,
+                       predict.function = pred.fun)
+  ciu.plain <- ciu.new(rf.model, credit_risk ~ ., german,
+                       predict.function = pred.fun)
+
+  top.concepts <- ciu.kg.get.child.features(pms[["Traditional Banking"]]$graph,
+                                            "Credit Worthiness")
 
   # Interesting instances:
-  #   i_good  – an instance predicted as "good" credit
-  #   i_bad   – an instance predicted as "bad" credit
-  #   i_border – borderline (close to 0.5 predicted probability)
-  preds <- predict(rf.model, german, type = "prob")
-  good.pred <- preds[, "good"]
-  i_good   <- which(german$credit_risk == "good" & good.pred > 0.85)[1]
-  i_bad    <- which(german$credit_risk == "bad"  & good.pred < 0.25)[1]
-  i_border <- which(abs(good.pred - 0.5) < 0.05)[1]
+  #   good    – confidently "good" (top decile of predicted p_good)
+  #   bad     – confidently "bad"  (bottom decile)
+  #   border  – closest to p_good = 0.5
+  #   typical – output close to the average prediction AND as many important
+  #             concepts as possible with near-zero influence (CU ≈ 0.5);
+  #             this is the instance where PI and influence differ most.
+  good.pred <- pred.fun(rf.model, german)[, "good"]
+  i_good   <- which(german$credit_risk == "good" &
+                      good.pred >= quantile(good.pred, 0.90))[1]
+  i_bad    <- which(german$credit_risk == "bad"  &
+                      good.pred <= quantile(good.pred, 0.10))[1]
+  i_border <- which.min(abs(good.pred - 0.5))
+  i_typical <- select.typical.instance(ciu.obj, german, target, good.pred,
+                                       concepts = top.concepts, out.ind = 2)
 
   focal.instances <- list(
-    good   = german[i_good,   colnames(german) != target, drop = FALSE],
-    bad    = german[i_bad,    colnames(german) != target, drop = FALSE],
-    border = german[i_border, colnames(german) != target, drop = FALSE]
+    good    = german[i_good,    colnames(german) != target, drop = FALSE],
+    bad     = german[i_bad,     colnames(german) != target, drop = FALSE],
+    border  = german[i_border,  colnames(german) != target, drop = FALSE],
+    typical = german[i_typical, colnames(german) != target, drop = FALSE]
   )
+  message(sprintf("German Credit focal instances (row, p_good): good=%d (%.2f), bad=%d (%.2f), border=%d (%.2f), typical=%d (%.2f); mean p_good=%.2f",
+                  i_good, good.pred[i_good], i_bad, good.pred[i_bad],
+                  i_border, good.pred[i_border], i_typical, good.pred[i_typical],
+                  mean(good.pred)))
 
   su <- list(
     data             = german,
+    model            = rf.model,
+    predict          = pred.fun,
+    pred.out         = good.pred,
     ciu              = ciu.obj,
     ciu.plain        = ciu.plain,
     pms              = pms,
     out.name         = "good",
     target           = target,
-    top.concepts     = ciu.kg.get.child.features(pms[["Traditional Banking"]]$graph,
-                                                 "Credit Worthiness"),
+    top.concepts     = top.concepts,
     top.concepts.ra  = ciu.kg.get.child.features(pms[["Risk Assessment"]]$graph,
                                                  "Credit Risk"),
     focal.instances  = focal.instances
   )
   cache.save(su, "german_setup")
   su
+}
+
+# CIU values are computed once per (dataset, instance, concepts, n.samples) and
+# reused by every figure, so the same instance always shows identical values.
+.meta.memo <- new.env()
+cached.meta <- function(su, instance, concepts.to.explain, n.samples) {
+  key <- paste(su$target, rownames(instance)[1],
+               paste(concepts.to.explain, collapse = "|"), n.samples, sep = "#")
+  if (!exists(key, envir = .meta.memo, inherits = FALSE)) {
+    set.seed(FIG_SEED)
+    assign(key, su$ciu$meta.explain(instance,
+                                    concepts.to.explain = concepts.to.explain,
+                                    n.samples = n.samples),
+           envir = .meta.memo)
+  }
+  get(key, envir = .meta.memo, inherits = FALSE)
 }
 
 # Shorthand: get an instance from the su list by name or index
@@ -134,62 +238,73 @@ get.instance <- function(su, i) {
 # ── 1b. Figure helpers ────────────────────────────────────────────────────────
 
 # Common theme tweaks for publication
-pub.theme <- function() {
+pub.theme <- function(legend = TRUE) {
   theme_bw() +
     theme(text = element_text(size = 9),
           strip.text = element_text(size = 8),
-          plot.title = element_text(size = 9, face = "bold"))
+          plot.title = element_text(size = 9, face = "bold"),
+          legend.position = if (legend) "right" else "none")
 }
 
 # ── 1c. Five-question figures (German Credit) ─────────────────────────────────
 
 #' Q1 "Why?" – PI plot (Potential Influence): CI bar + CU fill
-fig.why.pi <- function(su, i = "good", name = "fig_why_pi",
+fig.why.pi <- function(su, i = "typical", name = "fig_why_pi",
                        concepts = su$top.concepts,
-                       n.samples = 500) {
+                       n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
-  meta <- su$ciu$meta.explain(instance,
+  meta <- cached.meta(su, instance,
                               concepts.to.explain = concepts,
                               n.samples = n.samples)
   p <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                              output.names = su$out.name,
+                             show.input.values = FALSE,
                              plot.mode = "overlap",
+                             ci.colours = PI.CI.COLOURS,
+                             cu.colours = PI.CU.COLOURS,
                              sort = "CI") + pub.theme()
   save.fig(p, name, width = FIG_W_1COL)
   p
 }
 
 #' Q1b "Why?" – influence-only barplot
-fig.why.influence <- function(su, i = "good", name = "fig_why_influence",
+fig.why.influence <- function(su, i = "typical", name = "fig_why_influence",
                               concepts = su$top.concepts,
-                              neutral.CU = 0.5, n.samples = 500) {
+                              neutral.CU = 0.5, n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
-  meta <- su$ciu$meta.explain(instance,
+  meta <- cached.meta(su, instance,
                               concepts.to.explain = concepts,
                               n.samples = n.samples)
   p <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                              output.names = su$out.name,
+                             show.input.values = FALSE,
                              use.influence = TRUE,
                              neutral.CU = neutral.CU,
-                             sort = "absphi") + pub.theme()
+                             sort = "absphi") + pub.theme(legend = FALSE)
   save.fig(p, name, width = FIG_W_1COL)
   p
 }
 
 #' Key comparison figure: PI (left) vs. influence (right) with ALIGNED rows.
 #' Uses native row.order parameter (no force.row.order workaround needed).
-fig.pi.vs.influence <- function(su, i = "good", name = "fig_pi_vs_influence",
+fig.pi.vs.influence <- function(su, i = "typical", name = "fig_pi_vs_influence",
                                 concepts = su$top.concepts,
-                                neutral.CU = 0.5, n.samples = 500) {
+                                neutral.CU = 0.5, n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
-  meta <- su$ciu$meta.explain(instance,
+  meta <- cached.meta(su, instance,
                               concepts.to.explain = concepts,
                               n.samples = n.samples)
 
   # Build PI plot and extract CI-sorted row order
   p.pi <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                                 output.names = su$out.name,
+                                show.input.values = FALSE,
                                 plot.mode = "overlap",
+                                ci.colours = PI.CI.COLOURS,
+                                cu.colours = PI.CU.COLOURS,
                                 sort = "CI")
 
   # Extract the factor levels from the PI plot (bottom-to-top order)
@@ -199,16 +314,20 @@ fig.pi.vs.influence <- function(su, i = "good", name = "fig_pi_vs_influence",
   # Rebuild both panels with explicit row.order so they share the same axis
   p.pi  <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                                  output.names = su$out.name,
+                                 show.input.values = FALSE,
                                  plot.mode = "overlap",
+                                 ci.colours = PI.CI.COLOURS,
+                                 cu.colours = PI.CU.COLOURS,
                                  row.order = ord) +
-    ggtitle("a  Importance & Utility (PI)") + pub.theme()
+    ggtitle("Importance & Utility (PI)") + pub.theme()
 
   p.inf <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                                  output.names = su$out.name,
+                                 show.input.values = FALSE,
                                  use.influence = TRUE,
                                  neutral.CU = neutral.CU,
                                  row.order = ord) +
-    ggtitle("b  Contextual influence") + pub.theme()
+    ggtitle("Contextual influence") + pub.theme(legend = FALSE)
 
   combined <- p.pi + p.inf
   save.fig(combined, name)
@@ -218,17 +337,19 @@ fig.pi.vs.influence <- function(su, i = "good", name = "fig_pi_vs_influence",
 #' Q2 "Why not?" – influence for a BAD instance
 fig.why.not <- function(su, i = "bad", name = "fig_why_not",
                         concepts = su$top.concepts,
-                        neutral.CU = 0.5, n.samples = 500) {
+                        neutral.CU = 0.5, n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
-  meta <- su$ciu$meta.explain(instance,
+  meta <- cached.meta(su, instance,
                               concepts.to.explain = concepts,
                               n.samples = n.samples)
   p <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                              output.names = su$out.name,
+                             show.input.values = FALSE,
                              use.influence = TRUE,
                              neutral.CU = neutral.CU,
                              sort = "absphi") +
-    ggtitle("Why not? (bad credit instance)") + pub.theme()
+    ggtitle("Why not? (bad credit instance)") + pub.theme(legend = FALSE)
   save.fig(p, name, width = FIG_W_1COL)
   p
 }
@@ -236,7 +357,8 @@ fig.why.not <- function(su, i = "bad", name = "fig_why_not",
 #' Q3 "What if?" – IO (Input-Output) plot for one feature
 #' Uses ggplot.ciu with ind.input (singular!)
 fig.whatif.io <- function(su, i = "good", ind.input = 5, name = "fig_whatif_io",
-                          n.samples = 500) {
+                          n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
   p <- su$ciu.plain$ggplot.ciu(instance, ind.input = ind.input,
                                illustrate.CIU = TRUE,
@@ -259,13 +381,14 @@ fig.why.a.not.b <- function(su, i.a = "good", i.b = "bad",
                             name = "fig_why_a_not_b",
                             concepts = su$top.concepts,
                             out.ind = 2,
-                            n.samples = 500) {
+                            n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   inst.a <- get.instance(su, i.a)
   inst.b <- get.instance(su, i.b)
 
-  meta.a <- su$ciu$meta.explain(inst.a, concepts.to.explain = concepts,
+  meta.a <- cached.meta(su, inst.a, concepts.to.explain = concepts,
                                 n.samples = n.samples)
-  meta.b <- su$ciu$meta.explain(inst.b, concepts.to.explain = concepts,
+  meta.b <- cached.meta(su, inst.b, concepts.to.explain = concepts,
                                 n.samples = n.samples)
 
   # Extract the relevant output row from each meta result
@@ -281,8 +404,8 @@ fig.why.a.not.b <- function(su, i.a = "good", i.b = "bad",
 
   p <- ciu.ggplot.contrastive(meta.a, contr,
                               instance.names = c(lbl.a, lbl.b),
-                              question = "Why?") + pub.theme()
-  save.fig(p, name)
+                              question = "Why?") + pub.theme(legend = FALSE)
+  save.fig(p, name, width = FIG_W_1COL, height = 3.0)
   p
 }
 
@@ -290,30 +413,37 @@ fig.why.a.not.b <- function(su, i.a = "good", i.b = "bad",
 
 #' Show the same instance explained with two different IC vocabularies
 #' side by side, demonstrating vocabulary transparency.
-fig.vocabulary.comparison <- function(su, i = "good",
+fig.vocabulary.comparison <- function(su, i = "typical",
                                       name = "fig_vocabulary_comparison",
-                                      n.samples = 500) {
+                                      n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
 
   # Traditional Banking vocabulary
-  meta.tb <- su$ciu$meta.explain(instance,
+  meta.tb <- cached.meta(su, instance,
                                  concepts.to.explain = su$top.concepts,
                                  n.samples = n.samples)
   p.tb <- su$ciu$ggplot.col.ciu(ciu.meta = meta.tb,
                                 output.names = su$out.name,
+                                show.input.values = FALSE,
                                 plot.mode = "overlap",
+                                ci.colours = PI.CI.COLOURS,
+                                cu.colours = PI.CU.COLOURS,
                                 sort = "CI") +
-    ggtitle("a  Traditional Banking") + pub.theme()
+    ggtitle("Traditional Banking") + pub.theme()
 
   # Risk Assessment vocabulary
-  meta.ra <- su$ciu$meta.explain(instance,
+  meta.ra <- cached.meta(su, instance,
                                  concepts.to.explain = su$top.concepts.ra,
                                  n.samples = n.samples)
   p.ra <- su$ciu$ggplot.col.ciu(ciu.meta = meta.ra,
                                 output.names = su$out.name,
+                                show.input.values = FALSE,
                                 plot.mode = "overlap",
+                                ci.colours = PI.CI.COLOURS,
+                                cu.colours = PI.CU.COLOURS,
                                 sort = "CI") +
-    ggtitle("b  Risk Assessment") + pub.theme()
+    ggtitle("Risk Assessment") + pub.theme()
 
   combined <- p.tb + p.ra
   save.fig(combined, name)
@@ -328,7 +458,7 @@ fig.vocabulary.comparison <- function(su, i = "good",
 scan.ci.vs.influence <- function(su, n.inst = 100, seed = 42,
                                  concepts = su$top.concepts,
                                  neutral.CU = 0.5,
-                                 n.samples = 200,
+                                 n.samples = N_SAMPLES,
                                  use.cache = TRUE,
                                  cache.name = "german_scan") {
   if (use.cache) {
@@ -391,20 +521,18 @@ ranking.disagreement <- function(scan.df) {
 #' Points away from diagonal → divergence (importance invisible to SHAP).
 fig.ci.vs.influence <- function(scan.df, name = "fig_ci_vs_influence",
                                 dataset.label = "German Credit") {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   p <- ggplot(scan.df, aes(x = CI, y = absphi, colour = CU)) +
     geom_point(alpha = 0.4, size = 0.8) +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_abline(slope = 0.5, intercept = 0, linetype = "dashed", colour = "grey40") +
     scale_colour_gradient2(low = "red", mid = "yellow", high = "darkgreen",
                            midpoint = 0.5, limits = c(0, 1)) +
     labs(x = "Contextual Importance (CI)",
          y = "Contextual |influence| (|φ|)",
-         colour = "CU",
-         title = paste0(dataset.label,
-                        ": CI vs |influence| across instances & features"),
-         subtitle = "Points below diagonal: importance invisible to influence methods") +
+         colour = "CU") +   # envelope |phi| = CI/2 (dashed); title in figure legend
     theme_bw() +
     theme(text = element_text(size = 9))
-  save.fig(p, name)
+  save.fig(p, name, width = FIG_W_1COL, height = 3.0)
   p
 }
 
@@ -412,13 +540,13 @@ fig.ci.vs.influence <- function(scan.df, name = "fig_ci_vs_influence",
 #' A right-skewed distribution means most importance is NOT captured by influence.
 fig.divergence.hist <- function(scan.df, name = "fig_divergence_hist",
                                 dataset.label = "German Credit") {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   p <- ggplot(scan.df, aes(x = divergence)) +
     geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
     geom_vline(xintercept = 0, linetype = "dashed", colour = "firebrick") +
     labs(x = "Divergence  CI − 2|φ|",
          y = "Count",
-         title = paste0(dataset.label, ": divergence distribution"),
-         subtitle = "Positive values: importance not visible as influence") +
+         title = dataset.label) +
     theme_bw() +
     theme(text = element_text(size = 9))
   save.fig(p, name, width = FIG_W_1COL)
@@ -426,7 +554,8 @@ fig.divergence.hist <- function(scan.df, name = "fig_divergence_hist",
 }
 
 # ── 1f. Master function: all German Credit figures ────────────────────────────
-make.all.german.figures <- function(su = NULL, n.scan = 200, n.samples = 500) {
+make.all.german.figures <- function(su = NULL, n.scan = 200, n.samples = N_SAMPLES,
+                                    use.cache = TRUE) {
   if (is.null(su)) su <- german.setup()
 
   message("German Credit: Q1 PI plot ...")
@@ -451,7 +580,8 @@ make.all.german.figures <- function(su = NULL, n.scan = 200, n.samples = 500) {
   fig.vocabulary.comparison(su, n.samples = n.samples)
 
   message("German Credit: CI vs |influence| scan (n=", n.scan, ") ...")
-  scan.df <- scan.ci.vs.influence(su, n.inst = n.scan, n.samples = 150)
+  scan.df <- scan.ci.vs.influence(su, n.inst = n.scan, n.samples = N_SAMPLES,
+                                  use.cache = use.cache)
   fig.ci.vs.influence(scan.df, dataset.label = "German Credit")
   fig.divergence.hist(scan.df, dataset.label = "German Credit")
 
@@ -531,60 +661,74 @@ ames.setup <- function(use.cache = TRUE) {
 # ── 2b. Five-question figures (Ames Housing) ──────────────────────────────────
 
 fig.ames.why.pi <- function(su, i = "high", name = "fig_ames_why_pi",
-                            n.samples = 500) {
+                            n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
-  meta <- su$ciu$meta.explain(instance,
+  meta <- cached.meta(su, instance,
                               concepts.to.explain = su$top.concepts,
                               n.samples = n.samples)
   p <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                              output.names = su$out.name,
+                             show.input.values = FALSE,
                              plot.mode = "overlap",
+                             ci.colours = PI.CI.COLOURS,
+                             cu.colours = PI.CU.COLOURS,
                              sort = "CI") + pub.theme()
   save.fig(p, name, width = FIG_W_1COL)
   p
 }
 
 fig.ames.why.influence <- function(su, i = "high", name = "fig_ames_why_influence",
-                                   neutral.CU = 0.5, n.samples = 500) {
+                                   neutral.CU = 0.5, n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
-  meta <- su$ciu$meta.explain(instance,
+  meta <- cached.meta(su, instance,
                               concepts.to.explain = su$top.concepts,
                               n.samples = n.samples)
   p <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                              output.names = su$out.name,
+                             show.input.values = FALSE,
                              use.influence = TRUE,
                              neutral.CU = neutral.CU,
-                             sort = "absphi") + pub.theme()
+                             sort = "absphi") + pub.theme(legend = FALSE)
   save.fig(p, name, width = FIG_W_1COL)
   p
 }
 
 fig.ames.pi.vs.influence <- function(su, i = "high",
                                      name = "fig_ames_pi_vs_influence",
-                                     neutral.CU = 0.5, n.samples = 500) {
+                                     neutral.CU = 0.5, n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   instance <- get.instance(su, i)
-  meta <- su$ciu$meta.explain(instance,
+  meta <- cached.meta(su, instance,
                               concepts.to.explain = su$top.concepts,
                               n.samples = n.samples)
 
   # Get CI-sorted order from initial PI plot
   p.pi0 <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                                  output.names = su$out.name,
+                                 show.input.values = FALSE,
                                  plot.mode = "overlap",
+                                 ci.colours = PI.CI.COLOURS,
+                                 cu.colours = PI.CU.COLOURS,
                                  sort = "CI")
   ord <- levels(p.pi0$data$feature.labels)
 
   p.pi  <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                                  output.names = su$out.name,
+                                 show.input.values = FALSE,
                                  plot.mode = "overlap",
+                                 ci.colours = PI.CI.COLOURS,
+                                 cu.colours = PI.CU.COLOURS,
                                  row.order = ord) +
-    ggtitle("a  Importance & Utility (PI)") + pub.theme()
+    ggtitle("Importance & Utility (PI)") + pub.theme()
   p.inf <- su$ciu$ggplot.col.ciu(ciu.meta = meta,
                                  output.names = su$out.name,
+                                 show.input.values = FALSE,
                                  use.influence = TRUE,
                                  neutral.CU = neutral.CU,
                                  row.order = ord) +
-    ggtitle("b  Contextual influence") + pub.theme()
+    ggtitle("Contextual influence") + pub.theme(legend = FALSE)
 
   combined <- p.pi + p.inf
   save.fig(combined, name)
@@ -595,6 +739,7 @@ fig.ames.pi.vs.influence <- function(su, i = "high",
 fig.ames.whatif.io <- function(su, i = "median",
                                ind.input = which(colnames(su$data) == "Gr_Liv_Area") - 0L,
                                name = "fig_ames_whatif_io") {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   # Note: ind.input must be the column index in the DATA (excl. target here)
   # ciu.plain was built with Sale_Price ~ . so column indexing matches ames_data
   # but the closure sees all columns including target; find correct index:
@@ -621,13 +766,14 @@ fig.ames.whatif.io <- function(su, i = "median",
 fig.ames.why.a.not.b <- function(su, i.a = "high", i.b = "low",
                                  name = "fig_ames_why_a_not_b",
                                  out.ind = 1,
-                                 n.samples = 500) {
+                                 n.samples = N_SAMPLES) {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   inst.a <- get.instance(su, i.a)
   inst.b <- get.instance(su, i.b)
 
-  meta.a <- su$ciu$meta.explain(inst.a, concepts.to.explain = su$top.concepts,
+  meta.a <- cached.meta(su, inst.a, concepts.to.explain = su$top.concepts,
                                 n.samples = n.samples)
-  meta.b <- su$ciu$meta.explain(inst.b, concepts.to.explain = su$top.concepts,
+  meta.b <- cached.meta(su, inst.b, concepts.to.explain = su$top.concepts,
                                 n.samples = n.samples)
 
   frame.a <- ciu.list.to.frame(meta.a$ciuvals, out.ind = out.ind)
@@ -636,8 +782,8 @@ fig.ames.why.a.not.b <- function(su, i.a = "high", i.b = "low",
 
   p <- ciu.ggplot.contrastive(meta.a, contr,
                               instance.names = c(i.a, i.b),
-                              question = "Why?") + pub.theme()
-  save.fig(p, name)
+                              question = "Why?") + pub.theme(legend = FALSE)
+  save.fig(p, name, width = FIG_W_1COL, height = 3.0)
   p
 }
 
@@ -648,7 +794,7 @@ fig.ames.why.a.not.b <- function(su, i.a = "high", i.b = "low",
 scan.ames.ci.vs.influence <- function(su, n.inst = 150, seed = 42,
                                       concepts = su$top.concepts,
                                       neutral.CU = 0.5,
-                                      n.samples = 150,
+                                      n.samples = N_SAMPLES,
                                       use.cache = TRUE,
                                       cache.name = "ames_scan") {
   # Reuse the generic German Credit scanner – it only depends on su$ciu,
@@ -662,7 +808,8 @@ scan.ames.ci.vs.influence <- function(su, n.inst = 150, seed = 42,
 }
 
 # ── 2d. Master function: all Ames figures ─────────────────────────────────────
-make.all.ames.figures <- function(su = NULL, n.scan = 200, n.samples = 500) {
+make.all.ames.figures <- function(su = NULL, n.scan = 200, n.samples = N_SAMPLES,
+                                  use.cache = TRUE) {
   if (is.null(su)) su <- ames.setup()
 
   message("Ames: Q1 PI plot ...")
@@ -681,7 +828,8 @@ make.all.ames.figures <- function(su = NULL, n.scan = 200, n.samples = 500) {
   fig.ames.why.a.not.b(su, n.samples = n.samples)
 
   message("Ames: CI vs |influence| scan (n=", n.scan, ") ...")
-  scan.df <- scan.ames.ci.vs.influence(su, n.inst = n.scan, n.samples = 150)
+  scan.df <- scan.ames.ci.vs.influence(su, n.inst = n.scan, n.samples = N_SAMPLES,
+                                       use.cache = use.cache)
   fig.ci.vs.influence(scan.df,
                       name = "fig_ames_ci_vs_influence",
                       dataset.label = "Ames Housing")
@@ -701,21 +849,20 @@ make.all.ames.figures <- function(su = NULL, n.scan = 200, n.samples = 500) {
 #' Useful for showing that the divergence is a universal phenomenon.
 fig.combined.ci.vs.influence <- function(german.scan, ames.scan,
                                          name = "fig_combined_ci_vs_influence") {
+  set.seed(FIG_SEED)   # identical CIU estimates on every run and across figures
   german.scan$dataset <- "German Credit"
   ames.scan$dataset   <- "Ames Housing"
   df <- rbind(german.scan, ames.scan)
 
   p <- ggplot(df, aes(x = CI, y = absphi, colour = CU)) +
     geom_point(alpha = 0.35, size = 0.7) +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_abline(slope = 0.5, intercept = 0, linetype = "dashed", colour = "grey40") +
     scale_colour_gradient2(low = "red", mid = "yellow", high = "darkgreen",
                            midpoint = 0.5, limits = c(0, 1)) +
     facet_wrap(~dataset) +
     labs(x = "Contextual Importance (CI)",
          y = "Contextual |influence| (|φ|)",
-         colour = "CU",
-         title = "CI vs |influence|: divergence across datasets",
-         subtitle = "Diagonal = influence equals importance; below = invisible importance") +
+         colour = "CU") +   # envelope |phi| = CI/2 (dashed)
     theme_bw() +
     theme(text = element_text(size = 9), strip.text = element_text(size = 8))
   save.fig(p, name)
@@ -731,11 +878,11 @@ fig.combined.ci.vs.influence <- function(german.scan, ames.scan,
 make.all.figures <- function(use.cache = TRUE) {
   message("=== German Credit ===")
   su.german <- german.setup(use.cache = use.cache)
-  make.all.german.figures(su.german)
+  make.all.german.figures(su.german, use.cache = use.cache)
 
   message("=== Ames Housing ===")
   su.ames <- ames.setup(use.cache = use.cache)
-  make.all.ames.figures(su.ames)
+  make.all.ames.figures(su.ames, use.cache = use.cache)
 
   message("=== Combined figures ===")
   g.scan <- cache.load("german_scan")
