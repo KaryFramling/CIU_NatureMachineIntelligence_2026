@@ -12,6 +12,7 @@ Produces the following figure files (in ./figures/):
   pi_plot_wealth.pdf  -- CIU Potential Influence (PI) plot
   shap_wealth.pdf     -- SHAP attributions
   pi_vs_shap.pdf      -- PI plot + SHAP side by side
+  pi_contrastive_wealth.pdf -- contrastive PI plot: me vs. a wealthier neighbour
 
 Requires:  numpy, matplotlib  (pip install numpy matplotlib)
 
@@ -22,6 +23,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.patches import FancyArrowPatch
 import matplotlib.ticker as ticker
 
 # ── output directory ──────────────────────────────────────────────────────────
@@ -393,8 +395,8 @@ for i, (fname, sv) in enumerate(zip(FEATURE_NAMES, shap_vals)):
         ax.text(sv + 1, i, f"{sv:.1f}k",
                 va="center", ha="left", fontsize=7.5, color="#333")
     else:
-        ax.text(sv - 1, i, f"{sv:.1f}k",
-                va="center", ha="right", fontsize=7.5, color="#333")
+        ax.text(sv + 1, i, f"{sv:.1f}k",        # inside the bar: avoids the y-axis labels
+                va="center", ha="left", fontsize=7.5, color="white")
 fig.tight_layout()
 savefig("shap_wealth", fig)
 plt.close(fig)
@@ -439,11 +441,79 @@ for i, (fname, sv) in enumerate(zip(FEATURE_NAMES, shap_vals)):
         ax2.text(sv + 1, i, f"{sv:.1f}k",
                  va="center", ha="left", fontsize=7.5, color="#333")
     else:
-        ax2.text(sv - 1, i, f"{sv:.1f}k",
-                 va="center", ha="right", fontsize=7.5, color="#333")
+        ax2.text(sv + 1, i, f"{sv:.1f}k",       # inside the bar: avoids the y-axis labels
+                 va="center", ha="left", fontsize=7.5, color="white")
 
 fig.tight_layout()
 savefig("pi_vs_shap", fig)
+plt.close(fig)
+
+
+# =============================================================================
+# 11. CONTRASTIVE PI PLOT  --  "How do I get to my neighbour's wealth?"
+#
+#     Everything is evaluated in the context of the explained instance x (me):
+#       CI_i, CU_i      as in the PI plot
+#       CU_i(x_B)       utility of the neighbour's value x_B,i in MY context,
+#                       i.e. position of f(x with x_i := x_B,i) in [ymin_i, ymax_i]
+#       gap_i  = CI_i * (CU_i(x_B) - CU_i)   effect of adopting the neighbour's value
+#       room_i = CI_i * (1 - CU_i)           effect of the best possible value
+# =============================================================================
+
+print("Generating contrastive PI plot ...")
+
+neighbour = np.array([150.0, 200.0, 80.0])          # salary, savings, debt (k)
+y_nb = wealth_model(neighbour.reshape(1, -1))[0]
+
+CU_nb = []
+for idx, fname in enumerate(FEATURE_NAMES):
+    r = ciu[fname]
+    z = instance.copy()
+    z[idx] = neighbour[idx]
+    u_z = float(u(wealth_model(z.reshape(1, -1))[0]))
+    CU_nb.append((u_z - r["umin_i"]) / r["CI"])
+
+gaps  = [ci * (cub - cu) for ci, cu, cub in zip(CI_vals, CU_vals, CU_nb)]
+rooms = [ci * (1 - cu)   for ci, cu      in zip(CI_vals, CU_vals)]
+
+print(f"  Neighbour: salary={neighbour[0]:.0f}k  savings={neighbour[1]:.0f}k  "
+      f"debt={neighbour[2]:.0f}k   predicted wealth={y_nb:.1f}k")
+print(f"  {'':10} {'CU(me)':>7} {'CU(nb)':>7} {'gap':>7} {'room':>7}")
+for fname, cu, cub, g, rm in zip(FEATURE_NAMES, CU_vals, CU_nb, gaps, rooms):
+    print(f"  {fname:<10} {cu:>7.2f} {cub:>7.2f} {g:>+7.2f} {rm:>7.2f}")
+
+C_ARROW_GOOD = "#0B6E4F"   # darker than C_GREEN so the arrow stays visible on green bars
+C_ARROW_BAD  = "#A61B1A"
+
+fig, ax = plt.subplots(figsize=(4.2, 2.6))
+ax.barh(y_pos, CI_vals, height=0.45,
+        color=C_PI_BG, alpha=1.0, edgecolor="#999999", linewidth=0.8)
+ax.barh(y_pos, [ci * cu for ci, cu in zip(CI_vals, CU_vals)], height=0.45,
+        color=[_solid_color(cu) for cu in CU_vals], alpha=0.88)
+for i, (ci, cu, cub, g, rm) in enumerate(zip(CI_vals, CU_vals, CU_nb, gaps, rooms)):
+    x_me, x_nb = ci * cu, ci * cub
+    ax.plot([x_nb, x_nb], [i - 0.30, i + 0.30], color="black", lw=2, zorder=4)
+    ax.add_patch(FancyArrowPatch((x_me, i), (x_nb, i), arrowstyle="-|>",
+                                 mutation_scale=10, lw=1.8, zorder=5,
+                                 color=C_ARROW_GOOD if g > 0 else C_ARROW_BAD))
+    ax.text(ci + 0.01, i, f"gap {g:+.2f}, room {rm:.2f}",
+            va="center", fontsize=7.5, color="#333")
+ax.set_yticks(y_pos)
+ax.set_yticklabels(FEATURE_NAMES, fontsize=9)
+ax.set_xlim(0, 0.75)
+ax.set_xlabel("CI  in  [0, 1]", fontsize=8)
+ax.axvline(0, color="black", lw=0.5)
+CONTRAST_LEGEND = [
+    mpatches.Patch(facecolor=C_PI_BG, edgecolor="#999999", label="CI (me)"),
+    mpatches.Patch(facecolor=C_GREEN, alpha=0.88, label="CI x CU (me)"),
+    plt.Line2D([0], [0], color="black", lw=2, label="neighbour's value"),
+    plt.Line2D([0], [0], color=C_ARROW_GOOD, lw=1.8, label="worth adopting"),
+    plt.Line2D([0], [0], color=C_ARROW_BAD,  lw=1.8, label="not worth adopting"),
+]
+fig.legend(handles=CONTRAST_LEGEND, loc="lower center", ncol=3, fontsize=6.5,
+           frameon=False, bbox_to_anchor=(0.5, -0.10))
+fig.tight_layout()
+savefig("pi_contrastive_wealth", fig)
 plt.close(fig)
 
 print("\nDone. All figures written to ./figures/")
