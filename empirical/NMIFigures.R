@@ -913,11 +913,11 @@ concept.features <- function(su, concepts, feat.names) {
   for (pm in su$pms)
     voc <- c(voc, ciu.voc.from.graph(pm$graph, feat.names))
   res <- lapply(concepts, function(cn) {
-    if (cn %in% names(voc)) {
+    if (cn %in% feat.names) {
+      cn
+    } else if (cn %in% names(voc)) {
       v <- voc[[cn]]
       if (is.numeric(v)) feat.names[v] else as.character(v)
-    } else if (cn %in% feat.names) {
-      cn
     } else {
       stop("Cannot resolve concept '", cn, "' to feature columns.")
     }
@@ -939,7 +939,9 @@ scan.shap <- function(su, ciu.scan, n.inst = 200, seed = 42,
                       n.bg = N_SHAP_BG,
                       out.range = NULL,
                       use.cache = TRUE,
-                      cache.name = "german_shap_scan") {
+                      cache.name = "german_shap_scan",
+                      raw.cache.name = paste0(cache.name, "_raw"),
+                      reuse.raw = TRUE) {
   if (use.cache) {
     cached <- cache.load(cache.name)
     if (!is.null(cached)) return(cached)
@@ -975,8 +977,10 @@ scan.shap <- function(su, ciu.scan, n.inst = 200, seed = 42,
 
   # Raw per-feature SHAP values are cached separately, so that they survive
   # any later error and can be reused for other concept groupings.
-  raw.name <- paste0(cache.name, "_raw")
-  raw <- if (use.cache) cache.load(raw.name) else NULL
+  raw.name <- raw.cache.name
+  # The raw per-feature values depend only on the model, the instances and the
+  # background rows, so they are reused even when the grouping is recomputed.
+  raw <- if (use.cache || reuse.raw) cache.load(raw.name) else NULL
   if (is.null(raw) || !identical(raw$idx, idx) || !identical(raw$bg.idx, bg.idx)) {
     ks <- kernelshap::kernelshap(su.model(su),
                                  X = X.all[idx, , drop = FALSE],
@@ -1019,17 +1023,23 @@ shap.summary <- function(df, label = "", div.min = 0.1,
     div.shap.gt          = mean(df$divergence.shap > div.min),
     important.zero.ciu   = mean(df$CI > ci.min & df$absphi  < zero),
     important.zero.shap  = mean(df$CI > ci.min & df$absshap < zero),
+    cond.zero.ciu        = mean(df$absphi[df$CI > ci.min]  < zero),
+    cond.zero.shap       = mean(df$absshap[df$CI > ci.min] < zero),
+    share.important      = mean(df$CI > ci.min),
     spearman.phi.shap    = cor(df$phi, df$shap, method = "spearman"),
     pearson.phi.shap     = cor(df$phi, df$shap),
     sign.agreement       = mean(sign(df$phi) == sign(df$shap))
   )
   message(sprintf(paste0("%s: %d pairs. Divergence > %.2f: CIU influence %.1f%%, scaled SHAP %.1f%%. ",
                          "CI > %.2f with |value| < %.2f: CIU influence %.1f%%, SHAP %.1f%%. ",
+                         "Among the %.1f%% of pairs with CI > %.2f: |phi| < %.2f in %.1f%%, |SHAP| < %.2f in %.1f%%. ",
                          "phi vs SHAP: Spearman %.2f, Pearson %.2f, same sign %.1f%%."),
                   label, nrow(df), div.min,
                   100 * s["div.ciu.gt"], 100 * s["div.shap.gt"],
                   ci.min, zero,
                   100 * s["important.zero.ciu"], 100 * s["important.zero.shap"],
+                  100 * s["share.important"], ci.min,
+                  zero, 100 * s["cond.zero.ciu"], zero, 100 * s["cond.zero.shap"],
                   s["spearman.phi.shap"], s["pearson.phi.shap"],
                   100 * s["sign.agreement"]))
   invisible(s)
@@ -1131,6 +1141,63 @@ make.compact.figures <- function(h.german = 2.3, h.ames = 2.9,
   save.fig(p, "fig_ames_why_a_not_b_c", width = w.b, height = h.ames)
 
   message("Compact panels written to figures/*_c.pdf")
+  invisible(NULL)
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3c2 – Grid panels: 3 rows x 2 columns for Figs. 4 and 5
+# ═══════════════════════════════════════════════════════════════════════════════
+# Six half-width panels per dataset, each with its own label:
+#   a PI plot            b contextual influence
+#   c CI vs |phi|        d CI vs scaled |SHAP|
+#   e phi vs scaled SHAP f contrastive explanation
+# All panels are 3.5 in wide (placed at 0.48 of the text width), with reduced
+# heights so that three rows and the legend fit on one page.
+# Writes *_g.pdf files. Needs the SHAP scan (make.shap.comparison()).
+
+make.grid.figures <- function(h.bars.german = 1.9, h.bars.ames = 2.3,
+                              h.scatter = 2.0, w = FIG_W_1COL) {
+  small.legend <- theme(legend.key.height = unit(0.13, "in"),
+                        legend.key.width  = unit(0.12, "in"),
+                        legend.title = element_text(size = 7),
+                        legend.text  = element_text(size = 6),
+                        plot.margin  = margin(3, 3, 3, 3))
+  small.title <- theme(plot.title = element_text(size = 8))
+
+  one.dataset <- function(su, prefix, h.bars, pi.fun, ab.fun,
+                          scan.name, shap.name) {
+    # a, b: PI plot and influence, rows aligned (same height, same structure)
+    p <- pi.fun(su)
+    save.fig(p[[1]] + small.legend + small.title,
+             paste0(prefix, "pi_g"), width = w, height = h.bars)
+    save.fig(p[[2]] + small.title,
+             paste0(prefix, "influence_g"), width = w, height = h.bars)
+    # c, d, e: scatter plots
+    scan.df <- cache.load(scan.name)
+    shap.df <- cache.load(shap.name)
+    if (is.null(scan.df) || is.null(shap.df))
+      stop("Scan caches missing: run make.all.figures() and make.shap.comparison().")
+    save.fig(fig.ci.vs.influence(scan.df, name = paste0(prefix, "ci_vs_influence")) +
+               small.legend,
+             paste0(prefix, "ci_vs_influence_g"), width = w, height = h.scatter)
+    save.fig(fig.ci.vs.shap(shap.df, name = paste0(prefix, "ci_vs_shap")) +
+               small.legend,
+             paste0(prefix, "ci_vs_shap_g"), width = w, height = h.scatter)
+    save.fig(fig.phi.vs.shap(shap.df, name = paste0(prefix, "phi_vs_shap")) +
+               small.legend,
+             paste0(prefix, "phi_vs_shap_g"), width = w, height = h.scatter)
+    # f: contrastive explanation
+    save.fig(ab.fun(su) + small.title,
+             paste0(prefix, "why_a_not_b_g"), width = w, height = h.bars)
+  }
+
+  one.dataset(german.setup(), "fig_", h.bars.german,
+              fig.pi.vs.influence, fig.why.a.not.b,
+              "german_scan", "german_shap_scan")
+  one.dataset(ames.setup(), "fig_ames_", h.bars.ames,
+              fig.ames.pi.vs.influence, fig.ames.why.a.not.b,
+              "ames_scan", "ames_shap_scan")
+  message("Grid panels written to figures/*_g.pdf")
   invisible(NULL)
 }
 
@@ -1250,6 +1317,135 @@ make.ref.comparison <- function(use.cache = TRUE) {
 
   invisible(list(german = g, ames = a,
                  summary = rbind(german = g.sum, ames = a.sum)))
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3e – German Credit at the level of single features
+# ═══════════════════════════════════════════════════════════════════════════════
+# Same comparison as for the intermediate concepts, but for each of the 20
+# input features: CI, CU and phi per feature (new CIU scan, a few minutes),
+# and the per-feature Kernel SHAP values already in the raw SHAP cache.
+#   source("NMIFigures.R"); feat <- make.feature.comparison(); feat$summary
+
+make.feature.comparison <- function(n.scan = 200, use.cache = TRUE) {
+  su <- german.setup()
+  feat.names <- colnames(su$data)[colnames(su$data) != su$target]
+
+  # Quick test that single features are accepted as concepts, before the scan
+  test <- tryCatch(
+    su$ciu$meta.explain(su$data[1, feat.names, drop = FALSE],
+                        concepts.to.explain = feat.names[1:2], n.samples = 10),
+    error = function(e) e)
+  if (inherits(test, "error"))
+    stop("Single features are not accepted as concepts: ", conditionMessage(test))
+
+  message("=== German Credit: CIU scan for single features (n=", n.scan, ") ===")
+  f.scan <- scan.ci.vs.influence(su, n.inst = n.scan, concepts = feat.names,
+                                 n.samples = N_SAMPLES, use.cache = use.cache,
+                                 cache.name = "german_feature_scan")
+  if (is.null(f.scan) || nrow(f.scan) == 0)
+    stop("The CIU scan for single features returned no rows.")
+  f <- scan.shap(su, f.scan, n.inst = n.scan, concepts = feat.names,
+                 use.cache = use.cache,
+                 cache.name = "german_feature_shap_scan",
+                 raw.cache.name = "german_shap_scan_raw")
+  fig.ci.vs.influence(f, name = "fig_feat_ci_vs_influence")
+  fig.ci.vs.shap(f, "fig_feat_ci_vs_shap")
+  fig.phi.vs.shap(f, "fig_feat_phi_vs_shap")
+  f.sum <- shap.summary(f, "German Credit, single features")
+
+  # Concept level, for comparison
+  g <- cache.load("german_shap_scan")
+  g.sum <- if (!is.null(g)) shap.summary(g, "German Credit, concepts") else NULL
+
+  invisible(list(features = f, summary = rbind(features = f.sum, concepts = g.sum)))
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3f – Rebuild the German Credit setup after a vocabulary change
+# ═══════════════════════════════════════════════════════════════════════════════
+# Keeps the trained model and its calibration from the cache (so the model is
+# guaranteed unchanged and the raw Kernel SHAP values stay valid) and rebuilds
+# everything that depends on the vocabulary: partner models, CIU object,
+# top-level concepts and the automatically selected "typical" applicant.
+#   source("NMIFigures.R"); upd <- make.german.vocabulary.update(); upd$summary
+
+german.rebuild.vocabulary <- function(
+    ciu.dir = Sys.getenv("CIU_DIR", "~/Documents/Software/R/ciu")) {
+  su <- cache.load("german_setup")
+  if (is.null(su) || is.null(su$model) || is.null(su$predict))
+    stop("No cached German setup with model: run german.setup(use.cache = FALSE).")
+
+  kg.file <- file.path(path.expand(ciu.dir), "TestGermanCreditKnowledgeGraph.R")
+  if (!file.exists(kg.file))
+    stop("Vocabulary file not found: ", kg.file,
+         ". Pass ciu.dir = <path of the ciu source folder>.")
+  source(kg.file)   # current definition of create.GermanCredit.partner_models()
+
+  german <- su$data
+  target <- su$target
+  feat.names <- colnames(german)[colnames(german) != target]
+
+  pms <- create.GermanCredit.partner_models(german)
+  voc <- list()
+  for (pm in pms)
+    voc <- c(voc, ciu.voc.from.graph(pm$graph, feat.names))
+  top.concepts <- ciu.kg.get.child.features(pms[["Traditional Banking"]]$graph,
+                                            "Credit Worthiness")
+  covered <- unique(unlist(lapply(top.concepts, function(cn) feat.names[voc[[cn]]])))
+  missing <- setdiff(feat.names, covered)
+  message(sprintf("Traditional Banking covers %d of %d features%s",
+                  length(covered), length(feat.names),
+                  if (length(missing)) paste0("; not covered: ",
+                                              paste(missing, collapse = ", ")) else ""))
+
+  ciu.obj <- ciu.new(su$model, credit_risk ~ ., german, vocabulary = voc,
+                     predict.function = su$predict)
+  i_typical <- select.typical.instance(ciu.obj, german, target, su$pred.out,
+                                       concepts = top.concepts, out.ind = 2)
+  message(sprintf("Typical applicant: row %d, p_good = %.3f",
+                  i_typical, su$pred.out[i_typical]))
+
+  su$ciu             <- ciu.obj
+  su$pms             <- pms
+  su$top.concepts    <- top.concepts
+  su$top.concepts.ra <- ciu.kg.get.child.features(pms[["Risk Assessment"]]$graph,
+                                                  "Credit Risk")
+  su$focal.instances$typical <- german[i_typical, feat.names, drop = FALSE]
+  cache.save(su, "german_setup")
+  rm(list = ls(envir = .meta.memo), envir = .meta.memo)   # forget memoised CIU values
+  su
+}
+
+make.german.vocabulary.update <- function(n.scan = 200, ...) {
+  su <- german.rebuild.vocabulary(...)
+
+  # Example figures and CIU scan (recomputed)
+  make.all.german.figures(su, n.scan = n.scan, use.cache = FALSE)
+  g.scan <- cache.load("german_scan")
+  message(sprintf("German Credit: divergence CI - 2|phi| > 0.1 in %.1f%% of %d pairs",
+                  100 * mean(g.scan$divergence > 0.1), nrow(g.scan)))
+
+  # SHAP per concept: regrouped from the cached per-feature values
+  g <- scan.shap(su, g.scan, n.inst = n.scan, use.cache = FALSE,
+                 cache.name = "german_shap_scan")
+  fig.ci.vs.shap(g, "fig_ci_vs_shap")
+  fig.phi.vs.shap(g, "fig_phi_vs_shap")
+  g.sum <- shap.summary(g, "German Credit")
+
+  # Influence with SHAP's reference
+  r <- scan.ref.influence(su, g, use.cache = FALSE,
+                          cache.name = "german_ref_scan",
+                          shap.cache.name = "german_shap_scan")
+  fig.phiref.vs.shap(r, "fig_phiref_vs_shap")
+  r.sum <- ref.summary(r, "German Credit")
+
+  # Single features and grid panels
+  feat <- make.feature.comparison(n.scan = n.scan, use.cache = FALSE)
+  make.grid.figures()
+
+  message("German Credit updated for the new vocabulary.")
+  invisible(list(summary = g.sum, ref = r.sum, features = feat$summary))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
