@@ -1098,6 +1098,161 @@ make.shap.comparison <- function(n.scan = 200, use.cache = TRUE) {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3c – Compact panels for the combined main figures
+# ═══════════════════════════════════════════════════════════════════════════════
+# Layout of Figs. 4 and 5: row 1 = PI plot | influence | contrastive (bar
+# charts, reduced height), row 2 = CI vs |phi| | CI vs scaled |SHAP|.
+# All panels are saved at sizes that give the same scale factor when placed
+# at 0.65 / 0.345 / 0.48 of the text width, so fonts match across panels.
+# Writes *_c.pdf files and leaves the original figures untouched.
+
+#' Remove the y-axis labels of the second (influence) panel: its rows are
+#' aligned with those of the PI panel.
+strip.second.panel.labels <- function(p) {
+  p[[2]] <- p[[2]] + theme(axis.text.y  = element_blank(),
+                           axis.title.y = element_blank(),
+                           axis.ticks.y = element_blank())
+  p
+}
+
+make.compact.figures <- function(h.german = 2.3, h.ames = 2.9,
+                                 w.a = 4.7, w.b = 2.5) {
+  su.g <- german.setup()
+  p <- strip.second.panel.labels(fig.pi.vs.influence(su.g))
+  save.fig(p, "fig_pi_vs_influence_c", width = w.a, height = h.german)
+  small.title <- theme(plot.title = element_text(size = 7, hjust = 1))
+  p <- fig.why.a.not.b(su.g) + small.title
+  save.fig(p, "fig_why_a_not_b_c", width = w.b, height = h.german)
+
+  su.a <- ames.setup()
+  p <- strip.second.panel.labels(fig.ames.pi.vs.influence(su.a))
+  save.fig(p, "fig_ames_pi_vs_influence_c", width = w.a, height = h.ames)
+  p <- fig.ames.why.a.not.b(su.a) + small.title
+  save.fig(p, "fig_ames_why_a_not_b_c", width = w.b, height = h.ames)
+
+  message("Compact panels written to figures/*_c.pdf")
+  invisible(NULL)
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3d – CIU influence with SHAP's own reference
+# ═══════════════════════════════════════════════════════════════════════════════
+# Check of Proposition 1 on the two (non-additive) models. For every
+# concept-instance pair of the SHAP scan, the concept's features are replaced
+# by their values in each background row while all other features keep their
+# values in x. The mean output difference, divided by the output range, is
+# CIU's contextual influence with the reference utility taken from SHAP's
+# background data (part (a) of the Proposition, averaged over references).
+# For an additive model it equals the scaled SHAP value of the concept; the
+# remaining difference is due to interactions (part (c)).
+
+scan.ref.influence <- function(su, shap.df, seed = 42,
+                               concepts = su$top.concepts,
+                               use.cache = TRUE,
+                               cache.name = "german_ref_scan",
+                               shap.cache.name = "german_shap_scan") {
+  if (use.cache) {
+    cached <- cache.load(cache.name)
+    if (!is.null(cached)) return(cached)
+  }
+  raw <- cache.load(paste0(shap.cache.name, "_raw"))
+  if (is.null(raw)) stop("Run the SHAP scan first (make.shap.comparison()).")
+
+  feat.names <- colnames(su$data)[colnames(su$data) != su$target]
+  X.all  <- su$data[, feat.names, drop = FALSE]
+  groups <- concept.features(su, concepts, feat.names)
+  bg     <- X.all[raw$bg.idx, , drop = FALSE]
+  n.bg   <- nrow(bg)
+  model  <- su.model(su)
+  pred   <- su.scalar.predict(su)
+  out.range <- attr(shap.df, "out.range")
+  if (is.null(out.range)) {
+    y <- su$data[[su$target]]
+    out.range <- if (is.numeric(y)) diff(range(y)) else 1
+  }
+
+  rows <- lapply(raw$idx, function(ii) {
+    x  <- X.all[ii, , drop = FALSE]
+    fx <- pred(model, x)
+    # One block of n.bg hybrid rows per concept
+    hyb <- do.call(rbind, lapply(names(groups), function(cn) {
+      h <- x[rep(1, n.bg), , drop = FALSE]
+      h[, groups[[cn]]] <- bg[, groups[[cn]], drop = FALSE]
+      h
+    }))
+    f.h <- matrix(pred(model, hyb), nrow = n.bg)   # columns = concepts
+    data.frame(instance = ii,
+               feature  = names(groups),
+               phi.ref  = (fx - colMeans(f.h)) / out.range,
+               stringsAsFactors = FALSE)
+  })
+  df <- merge(shap.df, do.call(rbind, rows), by = c("instance", "feature"))
+  cache.save(df, cache.name)
+  df
+}
+
+ref.summary <- function(df, label = "") {
+  s <- c(pearson.ref.shap  = cor(df$phi.ref, df$shap),
+         spearman.ref.shap = cor(df$phi.ref, df$shap, method = "spearman"),
+         sign.agreement    = mean(sign(df$phi.ref) == sign(df$shap)),
+         mean.abs.diff     = mean(abs(df$phi.ref - df$shap)),
+         slope             = unname(coef(lm(shap ~ phi.ref, data = df))[2]),
+         pearson.phi.shap  = cor(df$phi, df$shap))
+  message(sprintf(paste0("%s: influence with SHAP reference vs scaled SHAP: Pearson %.3f, ",
+                         "Spearman %.3f, same sign %.1f%%, mean |difference| %.4f, slope %.2f ",
+                         "(phi at 0.5 vs SHAP: Pearson %.2f)."),
+                  label, s["pearson.ref.shap"], s["spearman.ref.shap"],
+                  100 * s["sign.agreement"], s["mean.abs.diff"], s["slope"],
+                  s["pearson.phi.shap"]))
+  invisible(s)
+}
+
+#' Scatter: contextual influence with SHAP's reference (x) vs scaled SHAP (y).
+fig.phiref.vs.shap <- function(df, name = "fig_phiref_vs_shap") {
+  lim <- max(abs(c(df$phi.ref, df$shap)))
+  p <- ggplot(df, aes(x = phi.ref, y = shap, colour = CI)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_hline(yintercept = 0, colour = "grey80") +
+    geom_vline(xintercept = 0, colour = "grey80") +
+    geom_point(alpha = 0.4, size = 0.8) +
+    scale_colour_viridis_c(limits = c(0, 1)) +
+    coord_cartesian(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+    labs(x = "Contextual influence, SHAP reference",
+         y = "Scaled SHAP",
+         colour = "CI") +
+    theme_bw() +
+    theme(text = element_text(size = 9))
+  save.fig(p, name, width = FIG_W_1COL, height = 3.0)
+  p
+}
+
+#'   source("NMIFigures.R"); ref <- make.ref.comparison(); ref$summary
+make.ref.comparison <- function(use.cache = TRUE) {
+  su.g <- german.setup()
+  g.shap <- cache.load("german_shap_scan")
+  if (is.null(g.shap)) stop("Run make.shap.comparison() first.")
+  message("=== German Credit: influence with SHAP reference ===")
+  g <- scan.ref.influence(su.g, g.shap, use.cache = use.cache,
+                          cache.name = "german_ref_scan",
+                          shap.cache.name = "german_shap_scan")
+  fig.phiref.vs.shap(g, "fig_phiref_vs_shap")
+  g.sum <- ref.summary(g, "German Credit")
+
+  su.a <- ames.setup()
+  a.shap <- cache.load("ames_shap_scan")
+  if (is.null(a.shap)) stop("Run make.shap.comparison() first.")
+  message("=== Ames Housing: influence with SHAP reference ===")
+  a <- scan.ref.influence(su.a, a.shap, use.cache = use.cache,
+                          cache.name = "ames_ref_scan",
+                          shap.cache.name = "ames_shap_scan")
+  fig.phiref.vs.shap(a, "fig_ames_phiref_vs_shap")
+  a.sum <- ref.summary(a, "Ames Housing")
+
+  invisible(list(german = g, ames = a,
+                 summary = rbind(german = g.sum, ames = a.sum)))
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 4 – Run everything
 # ═══════════════════════════════════════════════════════════════════════════════
 
