@@ -646,6 +646,7 @@ ames.setup <- function(use.cache = TRUE) {
 
   su <- list(
     data             = ames_data,
+    model            = gbm.model,
     ciu              = ciu.obj,
     ciu.plain        = ciu.plain,
     pms              = pms,
@@ -867,6 +868,233 @@ fig.combined.ci.vs.influence <- function(german.scan, ames.scan,
     theme(text = element_text(size = 9), strip.text = element_text(size = 8))
   save.fig(p, name)
   p
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3b – Direct comparison with SHAP (Kernel SHAP, interventional)
+# ═══════════════════════════════════════════════════════════════════════════════
+# For the same instances and intermediate concepts as the CI vs |phi| scans:
+#   1. Kernel SHAP values per feature (kernelshap package, background sample);
+#   2. summed within each intermediate concept;
+#   3. divided by the output range, which puts them on the scale of CIU's
+#      contextual influence (Proposition 1: phi = (A/U) * marginal contribution).
+# The result is merged with the CIU scan, so CI, CU, phi and scaled SHAP are
+# available for every concept-instance pair.
+
+N_SHAP_BG <- 100   # background rows for Kernel SHAP
+
+#' Model stored in the setup object; for older caches, taken from the CIU closure.
+su.model <- function(su) {
+  if (!is.null(su$model)) return(su$model)
+  m <- tryCatch(get("o.model", envir = environment(su$ciu$explain)),
+                error = function(e) NULL)
+  if (is.null(m))
+    stop("No model in the setup object. Re-run the setup with use.cache = FALSE.")
+  m
+}
+
+#' Scalar prediction function for the explained output.
+su.scalar.predict <- function(su) {
+  function(m, X, ...) {
+    if (!is.null(su$predict)) {
+      out <- su$predict(m, X)
+      if (is.data.frame(out) || is.matrix(out)) out <- out[, su$out.name]
+      as.numeric(out)
+    } else {
+      as.numeric(predict(m, X))
+    }
+  }
+}
+
+#' Feature (column) names belonging to each concept. Top-level raw features
+#' map to themselves.
+concept.features <- function(su, concepts, feat.names) {
+  voc <- list()
+  for (pm in su$pms)
+    voc <- c(voc, ciu.voc.from.graph(pm$graph, feat.names))
+  res <- lapply(concepts, function(cn) {
+    if (cn %in% names(voc)) {
+      v <- voc[[cn]]
+      if (is.numeric(v)) feat.names[v] else as.character(v)
+    } else if (cn %in% feat.names) {
+      cn
+    } else {
+      stop("Cannot resolve concept '", cn, "' to feature columns.")
+    }
+  })
+  names(res) <- concepts
+  bad <- vapply(res, function(f) length(f) == 0 || !all(f %in% feat.names),
+                logical(1))
+  if (any(bad))
+    stop("Concepts with unknown features: ",
+         paste(names(res)[bad], collapse = ", "))
+  res
+}
+
+#' Kernel SHAP scan matching scan.ci.vs.influence().
+#' Returns the CIU scan data frame with added columns
+#'   shap (scaled SHAP of the concept), absshap, divergence.shap = CI - 2|shap|.
+scan.shap <- function(su, ciu.scan, n.inst = 200, seed = 42,
+                      concepts = su$top.concepts,
+                      n.bg = N_SHAP_BG,
+                      out.range = NULL,
+                      use.cache = TRUE,
+                      cache.name = "german_shap_scan") {
+  if (use.cache) {
+    cached <- cache.load(cache.name)
+    if (!is.null(cached)) return(cached)
+  }
+  if (!requireNamespace("kernelshap", quietly = TRUE))
+    stop("Package 'kernelshap' is needed: install.packages('kernelshap')")
+
+  feat.names <- colnames(su$data)[colnames(su$data) != su$target]
+  X.all <- su$data[, feat.names, drop = FALSE]
+
+  # Resolve the concepts first, so that any problem shows up before the
+  # (long) Kernel SHAP computation.
+  groups <- concept.features(su, concepts, feat.names)
+
+  # Same instances as the CIU scan (same seed, same first call to sample())
+  set.seed(seed)
+  n.total <- nrow(su$data)
+  idx <- sample(n.total, min(n.inst, n.total))
+  if (!all(unique(ciu.scan$instance) %in% idx))
+    warning("SHAP scan instances differ from those of the CIU scan.")
+
+  set.seed(seed + 1)
+  bg.idx <- sample(n.total, min(n.bg, n.total))
+
+  # Output range used for scaling: the range on which the utility is defined
+  # (1 for a class probability, observed target range for regression).
+  if (is.null(out.range)) {
+    y <- su$data[[su$target]]
+    out.range <- if (is.numeric(y)) diff(range(y)) else 1
+  }
+  message(sprintf("Kernel SHAP: %d instances, %d features, %d background rows, output range %.4g",
+                  length(idx), length(feat.names), length(bg.idx), out.range))
+
+  # Raw per-feature SHAP values are cached separately, so that they survive
+  # any later error and can be reused for other concept groupings.
+  raw.name <- paste0(cache.name, "_raw")
+  raw <- if (use.cache) cache.load(raw.name) else NULL
+  if (is.null(raw) || !identical(raw$idx, idx) || !identical(raw$bg.idx, bg.idx)) {
+    ks <- kernelshap::kernelshap(su.model(su),
+                                 X = X.all[idx, , drop = FALSE],
+                                 bg_X = X.all[bg.idx, , drop = FALSE],
+                                 pred_fun = su.scalar.predict(su),
+                                 feature_names = feat.names,
+                                 verbose = TRUE)
+    S <- ks$S
+    if (is.list(S) && !is.data.frame(S)) S <- S[[1]]
+    S <- as.matrix(S)
+    colnames(S) <- feat.names
+    raw <- list(S = S, idx = idx, bg.idx = bg.idx, baseline = ks$baseline)
+    cache.save(raw, raw.name)
+  } else {
+    message("Using cached raw SHAP values (", raw.name, ").")
+  }
+  S <- raw$S
+  shap.df <- do.call(rbind, lapply(names(groups), function(cn) {
+    data.frame(instance = idx,
+               feature  = cn,
+               shap     = rowSums(S[, groups[[cn]], drop = FALSE]) / out.range,
+               stringsAsFactors = FALSE)
+  }))
+
+  df <- merge(ciu.scan, shap.df, by = c("instance", "feature"))
+  df$absshap         <- abs(df$shap)
+  df$divergence.shap <- df$CI - 2 * df$absshap
+  attr(df, "baseline")  <- raw$baseline
+  attr(df, "out.range") <- out.range
+  cache.save(df, cache.name)
+  df
+}
+
+#' Summary numbers for the paper.
+shap.summary <- function(df, label = "", div.min = 0.1,
+                         ci.min = 0.10, zero = 0.02) {
+  s <- c(
+    n.pairs              = nrow(df),
+    div.ciu.gt           = mean(df$divergence      > div.min),
+    div.shap.gt          = mean(df$divergence.shap > div.min),
+    important.zero.ciu   = mean(df$CI > ci.min & df$absphi  < zero),
+    important.zero.shap  = mean(df$CI > ci.min & df$absshap < zero),
+    spearman.phi.shap    = cor(df$phi, df$shap, method = "spearman"),
+    pearson.phi.shap     = cor(df$phi, df$shap),
+    sign.agreement       = mean(sign(df$phi) == sign(df$shap))
+  )
+  message(sprintf(paste0("%s: %d pairs. Divergence > %.2f: CIU influence %.1f%%, scaled SHAP %.1f%%. ",
+                         "CI > %.2f with |value| < %.2f: CIU influence %.1f%%, SHAP %.1f%%. ",
+                         "phi vs SHAP: Spearman %.2f, Pearson %.2f, same sign %.1f%%."),
+                  label, nrow(df), div.min,
+                  100 * s["div.ciu.gt"], 100 * s["div.shap.gt"],
+                  ci.min, zero,
+                  100 * s["important.zero.ciu"], 100 * s["important.zero.shap"],
+                  s["spearman.phi.shap"], s["pearson.phi.shap"],
+                  100 * s["sign.agreement"]))
+  invisible(s)
+}
+
+#' Scatter: CI (x) vs scaled |SHAP| (y), coloured by CU. Same layout as
+#' fig.ci.vs.influence(), so that the two can be compared directly.
+fig.ci.vs.shap <- function(df, name = "fig_ci_vs_shap") {
+  p <- ggplot(df, aes(x = CI, y = absshap, colour = CU)) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    geom_abline(slope = 0.5, intercept = 0, linetype = "dashed", colour = "grey40") +
+    scale_colour_gradient2(low = "red", mid = "yellow", high = "darkgreen",
+                           midpoint = 0.5, limits = c(0, 1)) +
+    labs(x = "Contextual Importance (CI)",
+         y = "Scaled |SHAP|",
+         colour = "CU") +
+    theme_bw() +
+    theme(text = element_text(size = 9))
+  save.fig(p, name, width = FIG_W_1COL, height = 3.0)
+  p
+}
+
+#' Scatter: CIU contextual influence (x) vs scaled SHAP (y), with the diagonal.
+fig.phi.vs.shap <- function(df, name = "fig_phi_vs_shap") {
+  lim <- max(abs(c(df$phi, df$shap)))
+  p <- ggplot(df, aes(x = phi, y = shap, colour = CI)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_hline(yintercept = 0, colour = "grey80") +
+    geom_vline(xintercept = 0, colour = "grey80") +
+    geom_point(alpha = 0.4, size = 0.8) +
+    scale_colour_viridis_c(limits = c(0, 1)) +
+    coord_cartesian(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+    labs(x = "Contextual influence (φ)",
+         y = "Scaled SHAP",
+         colour = "CI") +
+    theme_bw() +
+    theme(text = element_text(size = 9))
+  save.fig(p, name, width = FIG_W_1COL, height = 3.0)
+  p
+}
+
+#' SHAP comparison for both datasets. Uses the cached setups and CIU scans,
+#' so the other figures do not have to be regenerated:
+#'   source("NMIFigures.R"); res <- make.shap.comparison()
+make.shap.comparison <- function(n.scan = 200, use.cache = TRUE) {
+  su.g <- german.setup()
+  g.scan <- scan.ci.vs.influence(su.g, n.inst = n.scan, n.samples = N_SAMPLES)
+  message("=== German Credit: Kernel SHAP scan ===")
+  g <- scan.shap(su.g, g.scan, n.inst = n.scan, use.cache = use.cache,
+                 cache.name = "german_shap_scan")
+  fig.ci.vs.shap(g, "fig_ci_vs_shap")
+  fig.phi.vs.shap(g, "fig_phi_vs_shap")
+  g.sum <- shap.summary(g, "German Credit")
+
+  su.a <- ames.setup()
+  a.scan <- scan.ames.ci.vs.influence(su.a, n.inst = n.scan, n.samples = N_SAMPLES)
+  message("=== Ames Housing: Kernel SHAP scan ===")
+  a <- scan.shap(su.a, a.scan, n.inst = n.scan, use.cache = use.cache,
+                 cache.name = "ames_shap_scan")
+  fig.ci.vs.shap(a, "fig_ames_ci_vs_shap")
+  fig.phi.vs.shap(a, "fig_ames_phi_vs_shap")
+  a.sum <- shap.summary(a, "Ames Housing")
+
+  invisible(list(german = g, ames = a,
+                 summary = rbind(german = g.sum, ames = a.sum)))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
