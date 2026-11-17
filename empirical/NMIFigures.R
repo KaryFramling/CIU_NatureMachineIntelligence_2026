@@ -1155,6 +1155,36 @@ make.compact.figures <- function(h.german = 2.3, h.ames = 2.9,
 # heights so that three rows and the legend fit on one page.
 # Writes *_g.pdf files. Needs the SHAP scan (make.shap.comparison()).
 
+#' Readable labels for concepts and raw features in the figures.
+CONCEPT.LABELS <- c(Gr_Liv_Area = "Living Area", First_Flr_SF = "First Floor Area")
+pretty.concept <- function(x) {
+  out <- ifelse(x %in% names(CONCEPT.LABELS), CONCEPT.LABELS[x], x)
+  # Title case for multi-word concept names ("House condition" -> "House Condition")
+  vapply(strsplit(out, " ", fixed = TRUE), function(w) {
+    w <- ifelse(w %in% c("&", "and", "of"), w,
+                paste0(toupper(substring(w, 1, 1)), substring(w, 2)))
+    paste(w, collapse = " ")
+  }, character(1), USE.NAMES = FALSE)
+}
+
+#' Facet strip: "good (0.699)" -> "P(good) = 0.699", "1 (523206)" -> "Sale price = 523,206 USD".
+pretty.output <- function(v) {
+  num <- suppressWarnings(as.numeric(sub("^.*\\(([-0-9.eE]+)\\)$", "\\1", v)))
+  lab <- sub(" \\(.*$", "", v)
+  ifelse(lab == "good", sprintf("P(good) = %.3f", num),
+         ifelse(!is.na(num) & num > 1000,
+                paste0("Sale price = ", formatC(num, format = "d", big.mark = ","), " USD"),
+                v))
+}
+
+#' Concept bar charts from ciu: "Concept" axis, readable labels and strip.
+polish.bars <- function(p) {
+  p <- p + xlab("Concept") + scale_x_discrete(labels = pretty.concept)
+  if (inherits(p$facet, "FacetWrap"))
+    p <- p + facet_wrap(~Output, labeller = as_labeller(pretty.output))
+  p
+}
+
 make.grid.figures <- function(h.bars.german = 1.9, h.bars.ames = 2.3,
                               h.scatter = 2.0, w = FIG_W_1COL) {
   small.legend <- theme(legend.key.height = unit(0.13, "in"),
@@ -1168,9 +1198,9 @@ make.grid.figures <- function(h.bars.german = 1.9, h.bars.ames = 2.3,
                           scan.name, shap.name) {
     # a, b: PI plot and influence, rows aligned (same height, same structure)
     p <- pi.fun(su)
-    save.fig(p[[1]] + small.legend + small.title,
+    save.fig(polish.bars(p[[1]]) + small.legend + small.title,
              paste0(prefix, "pi_g"), width = w, height = h.bars)
-    save.fig(p[[2]] + small.title,
+    save.fig(polish.bars(p[[2]]) + small.title,
              paste0(prefix, "influence_g"), width = w, height = h.bars)
     # c, d, e: scatter plots
     scan.df <- cache.load(scan.name)
@@ -1187,7 +1217,7 @@ make.grid.figures <- function(h.bars.german = 1.9, h.bars.ames = 2.3,
                small.legend,
              paste0(prefix, "phi_vs_shap_g"), width = w, height = h.scatter)
     # f: contrastive explanation
-    save.fig(ab.fun(su) + small.title,
+    save.fig(polish.bars(ab.fun(su)) + small.title,
              paste0(prefix, "why_a_not_b_g"), width = w, height = h.bars)
   }
 
@@ -1446,6 +1476,115 @@ make.german.vocabulary.update <- function(n.scan = 200, ...) {
 
   message("German Credit updated for the new vocabulary.")
   invisible(list(summary = g.sum, ref = r.sum, features = feat$summary))
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3g – Robustness: CI and CU restricted to observed data
+# ═══════════════════════════════════════════════════════════════════════════════
+# Instead of perturbing a concept's features over their full ranges, its values
+# are taken jointly from each of the 100 background rows of the SHAP scan, with
+# all other features kept at their values in x. umin and umax are then the
+# lowest and highest outputs among these hybrids and f(x) itself, so no
+# combination of values within a concept is ever created that does not occur
+# in the data. CI is divided by the same output range as before.
+#   source("NMIFigures.R"); rob <- make.data.restricted.check(); rob$summary
+
+scan.data.restricted <- function(su, shap.df, concepts = su$top.concepts,
+                                 use.cache = TRUE,
+                                 cache.name = "german_datarange_scan",
+                                 shap.cache.name = "german_shap_scan") {
+  if (use.cache) {
+    cached <- cache.load(cache.name)
+    if (!is.null(cached)) return(cached)
+  }
+  raw <- cache.load(paste0(shap.cache.name, "_raw"))
+  if (is.null(raw)) stop("Run the SHAP scan first (make.shap.comparison()).")
+
+  feat.names <- colnames(su$data)[colnames(su$data) != su$target]
+  X.all  <- su$data[, feat.names, drop = FALSE]
+  groups <- concept.features(su, concepts, feat.names)
+  bg     <- X.all[raw$bg.idx, , drop = FALSE]
+  n.bg   <- nrow(bg)
+  model  <- su.model(su)
+  pred   <- su.scalar.predict(su)
+  out.range <- attr(shap.df, "out.range")
+  if (is.null(out.range)) {
+    y <- su$data[[su$target]]
+    out.range <- if (is.numeric(y)) diff(range(y)) else 1
+  }
+
+  rows <- lapply(raw$idx, function(ii) {
+    x  <- X.all[ii, , drop = FALSE]
+    fx <- pred(model, x)
+    hyb <- do.call(rbind, lapply(names(groups), function(cn) {
+      h <- x[rep(1, n.bg), , drop = FALSE]
+      h[, groups[[cn]]] <- bg[, groups[[cn]], drop = FALSE]
+      h
+    }))
+    f.h  <- matrix(pred(model, hyb), nrow = n.bg)   # columns = concepts
+    ymin <- pmin(apply(f.h, 2, min), fx)
+    ymax <- pmax(apply(f.h, 2, max), fx)
+    ci   <- (ymax - ymin) / out.range
+    cu   <- ifelse(ymax > ymin, (fx - ymin) / (ymax - ymin), 0)
+    data.frame(instance = ii, feature = names(groups),
+               CI.data = ci, CU.data = cu, phi.data = ci * (cu - 0.5),
+               stringsAsFactors = FALSE)
+  })
+  df <- merge(shap.df, do.call(rbind, rows), by = c("instance", "feature"))
+  df$absphi.data <- abs(df$phi.data)
+  attr(df, "out.range") <- out.range
+  cache.save(df, cache.name)
+  df
+}
+
+data.restricted.summary <- function(df, label = "", ci.min = 0.10, zero = 0.02) {
+  imp <- df$CI.data > ci.min
+  s <- c(share.important        = mean(imp),
+         cond.zero.shap         = mean(df$absshap[imp]     < zero),
+         cond.zero.phi.data     = mean(df$absphi.data[imp] < zero),
+         cond.zero.shap.full    = mean(df$absshap[df$CI > ci.min] < zero),
+         cond.zero.phi.full     = mean(df$absphi[df$CI > ci.min]  < zero),
+         pearson.ci.full.data   = cor(df$CI, df$CI.data),
+         spearman.ci.full.data  = cor(df$CI, df$CI.data, method = "spearman"),
+         median.ratio.ci        = median(df$CI.data / pmax(df$CI, 1e-12)),
+         pearson.cu.full.data   = cor(df$CU, df$CU.data))
+  message(sprintf(paste0("%s, data-restricted ranges: %.1f%% of pairs with CI > %.2f. ",
+                         "Among them |SHAP| < %.2f in %.1f%% and |phi| < %.2f in %.1f%% ",
+                         "(full ranges: %.1f%% and %.1f%%). CI full vs data: Pearson %.2f, ",
+                         "Spearman %.2f, median ratio %.2f. CU: Pearson %.2f."),
+                  label, 100 * s["share.important"], ci.min,
+                  zero, 100 * s["cond.zero.shap"], zero, 100 * s["cond.zero.phi.data"],
+                  100 * s["cond.zero.shap.full"], 100 * s["cond.zero.phi.full"],
+                  s["pearson.ci.full.data"], s["spearman.ci.full.data"],
+                  s["median.ratio.ci"], s["pearson.cu.full.data"]))
+  invisible(s)
+}
+
+#' CI from data-restricted ranges (x) vs scaled |SHAP| (y), coloured by CU.
+fig.ci.data.vs.shap <- function(df, name = "fig_ci_data_vs_shap") {
+  d <- data.frame(CI = df$CI.data, absshap = df$absshap, CU = df$CU.data)
+  p <- fig.ci.vs.shap(d, name = paste0(name, "_tmp")) +
+    labs(x = "Contextual Importance (CI), data-restricted ranges")
+  save.fig(p, name, width = FIG_W_1COL, height = 3.0)
+  p
+}
+
+make.data.restricted.check <- function(use.cache = TRUE) {
+  res <- list()
+  for (ds in c("german", "ames")) {
+    su <- if (ds == "german") german.setup() else ames.setup()
+    shap.df <- cache.load(paste0(ds, "_shap_scan"))
+    if (is.null(shap.df)) stop("Run make.shap.comparison() first.")
+    message("=== ", ds, ": CI and CU from observed data rows ===")
+    d <- scan.data.restricted(su, shap.df, use.cache = use.cache,
+                              cache.name = paste0(ds, "_datarange_scan"),
+                              shap.cache.name = paste0(ds, "_shap_scan"))
+    fig.ci.data.vs.shap(d, if (ds == "german") "fig_ci_data_vs_shap"
+                           else "fig_ames_ci_data_vs_shap")
+    res[[ds]] <- data.restricted.summary(d, if (ds == "german") "German Credit"
+                                            else "Ames Housing")
+  }
+  invisible(list(summary = do.call(rbind, res)))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
